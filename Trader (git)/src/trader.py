@@ -8,13 +8,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Configuration
-DATA_DIR = "../backtest_data"
+DATA_DIR = "../../backtest_data"
 BTC_FILE = "BTCUSDT_5m.csv"
 INVESTMENT_PER_TRADE = 200
 MAX_CAPITAL = 1000
 COMMISSION_USDT = 1
 MAX_HOLDING_CANDLES = 15
-model = load("momentum_model.pkl")
+model = load("../momentum_model.pkl")
 
 class Trader:
     def __init__(self, strategy: TradingStrategy):

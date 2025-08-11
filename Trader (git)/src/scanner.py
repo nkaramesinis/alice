@@ -8,7 +8,7 @@ from requests.exceptions import RequestException
 
 # Configuration
 DATA_SOURCE = "binance"  # Options: 'binance', 'file'
-CSV_FILE = "top_50_binance_tickers.csv"  # Path to tickers list
+CSV_FILE = "../top_50_binance_tickers.csv"  # Path to tickers list
 INTERVAL = "5m"
 CANDLE_LIMIT = 48  # 4 hours of 5-minute candles
 PRICE_CHANGE_THRESHOLD = 0.20  # 20%

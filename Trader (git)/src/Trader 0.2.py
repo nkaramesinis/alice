@@ -5,7 +5,7 @@ import ta
 from abc import ABC, abstractmethod
 
 # Configuration
-DATA_DIR = "../backtest_data"
+DATA_DIR = "../../backtest_data"
 BTC_FILE = "BTCUSDT_5m.csv"
 PROFIT_TARGET_PCT = 0.03
 STOP_LOSS_PCT = 0.01

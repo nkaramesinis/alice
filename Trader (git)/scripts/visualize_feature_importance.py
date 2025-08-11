@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # Load model
-model = joblib.load("momentum_model.pkl")
+model = joblib.load("../momentum_model.pkl")
 
 # Define feature names (must match training order)
 feature_names = ["ema_gap", "rsi", "volume_ratio", "bb_width", "above_ema_50"]

@@ -2,8 +2,8 @@
 import os
 import pandas as pd
 
-DATA_DIR = "../backtest_data"
-OUTPUT_FILE = "consolidated_5m_data.csv"
+DATA_DIR = "../../backtest_data"
+OUTPUT_FILE = "../consolidated_5m_data.csv"
 
 
 def consolidate_5m_files(data_dir, output_file):

@@ -5,8 +5,8 @@ import pandas as pd
 import ta
 
 # Configuration
-DATA_DIR = "../backtest_data"
-OUTPUT_FILE = "ml_dataset.csv"
+DATA_DIR = "../../backtest_data"
+OUTPUT_FILE = "../ml_dataset.csv"
 PROFIT_TARGET_PCT = 0.03
 STOP_LOSS_PCT = 0.01
 MAX_HOLDING_CANDLES = 15

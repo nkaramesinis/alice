@@ -8,7 +8,7 @@ from strategy_base import TradingStrategy
 class MLMomentumStrategy(TradingStrategy):
     def __init__(self):
         # Load trained ML model
-        self.model = joblib.load("momentum_model.pkl")
+        self.model = joblib.load("../momentum_model.pkl")
 
     def filters_pass(self, candle, market_context) -> bool:
         try:

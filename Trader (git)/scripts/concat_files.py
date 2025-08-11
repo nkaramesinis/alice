@@ -1,6 +1,6 @@
 # concat_files.py
 
-FILE_1 = "ml_dataset.csv"
+FILE_1 = "../ml_dataset.csv"
 FILE_2 = "ml_dataset2.csv"
 OUTPUT_FILE = "combined_output.csv"
 SWITCH_LINE = "-- SWITCH --"
