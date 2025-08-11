@@ -1,100 +1,106 @@
-# backtester.py
-import csv
 import os
 import time
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import timedelta
 from requests.exceptions import RequestException, ConnectionError
 from urllib3.exceptions import ProtocolError
 
-INTERVALS = ["5m"]
-CANDLE_LIMIT = 48  # Not used anymore directly
-DAYS_LIMIT = 2
-START_DATE = "2025-06-01 00:00:00"  # Set your desired start date here
-OUTPUT_DIR = "../backtest_data_20250602-01"
+# ========================
+# FIXED SETTINGS
+# ========================
+START_DATE = "2025-06-20 00:00:00"   # start datetime
+DAYS_LIMIT = 5                       # number of days to fetch
+INTERVAL = "5m"                       # candle interval
+OUTPUT_DIR = "../backtest_data_20250620-5days"  # where to save CSVs
+TARGET_TICKERS = ["BTCUSDT", "SOLUSDT", "ETHUSDT"]  # [] = all USDT spot
+# ========================
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def get_spot_tickers(currency="USDT"):
+def get_spot_tickers(quote="USDT"):
     url = "https://api.binance.com/api/v3/exchangeInfo"
-    response = requests.get(url)
-    data = response.json()
-
-    spot_tickers = [
-        s["symbol"] for s in data["symbols"]
-        if s["status"] == "TRADING"
-        and s["quoteAsset"] == currency
-        and s["isSpotTradingAllowed"]
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()["symbols"]
+    return [
+        s["symbol"]
+        for s in data
+        if s.get("isSpotTradingAllowed")
+        and s.get("status") == "TRADING"
+        and s.get("quoteAsset") == quote
     ]
 
-    return spot_tickers
 
-def fetch_binance_candles_from_start(ticker, interval, start_date, days_limit, retries=5, delay=3):
-    start_time = int(pd.to_datetime(start_date).timestamp() * 1000)
-    end_time = int((pd.to_datetime(start_date) + timedelta(days=days_limit)).timestamp() * 1000)
-    all_candles = []
-
-    while start_time < end_time:
+def fetch_klines_since(ticker, interval, start_date, days, retries=5, delay=3):
+    start = int(pd.to_datetime(start_date).timestamp() * 1000)
+    end = int(
+        (pd.to_datetime(start_date) + timedelta(days=days)).timestamp() * 1000
+    )
+    out = []
+    while start < end:
         url = "https://api.binance.com/api/v3/klines"
         params = {
             "symbol": ticker,
             "interval": interval,
-            "startTime": start_time,
-            "limit": 1000
+            "startTime": start,
+            "limit": 1000,
         }
-
         for attempt in range(retries):
             try:
-                response = requests.get(url, params=params, timeout=10)
-                if response.status_code == 200:
-                    batch = response.json()
-                    if not batch:
-                        return all_candles
-                    all_candles.extend(batch)
-                    start_time = batch[-1][0] + 1  # move start_time to just after last returned candle
-                    break
-                elif response.status_code == 429:
-                    wait_time = delay + random.uniform(1, 3)
-                    print(f"[RATE LIMIT] Too many requests. Waiting {wait_time:.2f} seconds...")
-                    time.sleep(wait_time)
-                elif response.status_code == 418:
-                    print("[BANNED] IP temporarily banned by Binance. Exiting.")
-                    return all_candles
-                else:
-                    print(f"[HTTP ERROR {response.status_code}] {response.text}")
-                    return all_candles
-            except (RequestException, ConnectionError, ProtocolError) as e:
-                print(f"[RETRY {attempt + 1}] Network error: {e}. Waiting {delay} seconds before retry...")
-                time.sleep(delay)
-                delay *= 2
+                res = requests.get(url, params=params, timeout=15)
+                if res.status_code == 429:  # rate limit
+                    time.sleep(60)
+                    continue
+                res.raise_for_status()
+                batch = res.json()
+                if not batch:
+                    return out
+                out.extend(batch)
+                start = batch[-1][6] + 1  # move to next candle
+                time.sleep(0.2)
+                break
+            except (RequestException, ConnectionError, ProtocolError):
+                if attempt == retries - 1:
+                    raise
+                time.sleep(delay * (attempt + 1))
+    return out
 
-    return all_candles
 
-def save_candles_to_csv(ticker, interval, candles):
-    if not candles:
-        return
+def save_csv(ticker, interval, candles, out_dir):
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "num_trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ]
+    df = pd.DataFrame(candles, columns=cols)
+    df = df[["open_time", "open", "high", "low", "close", "volume", "close_time", "num_trades"]]
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+    fp = os.path.join(out_dir, f"{ticker}_{interval}.csv")
+    df.to_csv(fp, index=False)
+    return fp
 
-    filename = os.path.join(OUTPUT_DIR, f"{ticker}_{interval}.csv")
-    with open(filename, mode="w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "open", "high", "low", "close", "volume"])
-        for c in candles:
-            writer.writerow([
-                datetime.fromtimestamp(c[0] / 1000).strftime("%Y-%m-%d %H:%M:%S"),
-                c[1], c[2], c[3], c[4], c[5]
-            ])
 
 def main():
-    tickers = get_spot_tickers("USDT")
-    print(f"Fetched {len(tickers)} tickers")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    for ticker in tickers:
-        print(f"Fetching {ticker}...")
-        for interval in INTERVALS:
-            candles = fetch_binance_candles_from_start(ticker, interval, START_DATE, DAYS_LIMIT)
-            save_candles_to_csv(ticker, interval, candles)
-            time.sleep(0.1)
+    if TARGET_TICKERS:
+        tickers = TARGET_TICKERS
+    else:
+        tickers = get_spot_tickers("USDT")
+
+    print(f"Fetching {len(tickers)} tickers → {OUTPUT_DIR}")
+    for i, t in enumerate(tickers, 1):
+        try:
+            kl = fetch_klines_since(t, INTERVAL, START_DATE, DAYS_LIMIT)
+            if kl:
+                path = save_csv(t, INTERVAL, kl, OUTPUT_DIR)
+                print(f"[{i}/{len(tickers)}] {t}: {len(kl)} candles → {path}")
+            else:
+                print(f"[{i}/{len(tickers)}] {t}: no data")
+        except Exception as e:
+            print(f"[{i}/{len(tickers)}] {t}: ERROR {e}")
+
 
 if __name__ == "__main__":
     main()

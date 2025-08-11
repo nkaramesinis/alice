@@ -25,3 +25,5 @@ models/
 
 # macOS
 .DS_Store
+
+backtestingData2.py
