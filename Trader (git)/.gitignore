@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+
+# Data files
+*.csv
+*.parquet
+*.sqlite
+data/
+
+# Model files
+*.pkl
+models/
+
+# macOS
+.DS_Store
