@@ -1,218 +1,152 @@
-import pandas as pd
-import os
-import ta
-from ta.volatility import BollingerBands
-from strategy_base import TradingStrategy
-from joblib import load
-import numpy as np
-import matplotlib.pyplot as plt
+from __future__ import annotations
+from typing import Dict, Any, Optional
 
-# Configuration
-DATA_DIR = "../../backtest_data"
-BTC_FILE = "BTCUSDT_5m.csv"
-INVESTMENT_PER_TRADE = 200
-MAX_CAPITAL = 1000
-COMMISSION_USDT = 1
-MAX_HOLDING_CANDLES = 15
-model = load("../momentum_model.pkl")
+Candle = Dict[str, float | int]
+
 
 class Trader:
-    def __init__(self, strategy: TradingStrategy):
+    """
+    Clean trading engine (no I/O, no plotting):
+      - Receives one candle at a time via on_candle()
+      - Delegates decision-making to a strategy object
+      - Manages positions, PnL, and a per-symbol state bag
+
+    Strategy contract (example):
+      strategy.on_candle(symbol: str, candle: Candle, market_context: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
+      where the returned dict may include keys like:
+        {"open_long": bool, "close_long": bool, "size": float, "tp": float, "sl": float}
+    """
+
+    def __init__(self, strategy, initial_capital: float, max_positions: int = 5):
         self.strategy = strategy
-        self.total_profit = 0
-        self.total_trades = 0
-        self.successful_trades = 0
-        self.positions = []
-        self.recent_losses = []
-        self.trading_paused_until = None
-        self.recovery_phase = 3  # 1: 20%, 2: 50%, 3: 100%
-        self.current_capital = MAX_CAPITAL
-        self.recent_candles = []
-        self.trade_signals = []  # Store trade signals
+        self.initial_capital = float(initial_capital)
+        self.cash = float(initial_capital)
+        self.max_positions = int(max_positions)
 
-    def trade(self, candle, market_context) -> int:
-        self.recent_candles.append(candle)
-        if len(self.recent_candles) < 2:
-            return 0  # Not enough data
-        if len(self.recent_candles) > 50:
-            self.recent_candles.pop(0)
+        # Open positions by symbol
+        # schema: {symbol: {"entry": float, "size": float, "tp": Optional[float], "sl": Optional[float]}}
+        self.positions: Dict[str, Dict[str, Any]] = {}
 
-        previous_candle = self.recent_candles[-2]
-        if self.strategy.should_enter_trade(candle, previous_candle, market_context):
-            return 1  # Buy signal
-        return 0  # No signal
+        # Per-symbol rolling state for indicators, counters, etc. (owned by the engine, used by strategies)
+        self.state: Dict[str, Dict[str, Any]] = {}
 
-    def load_data(self):
-        dfs = []
-        for file in os.listdir(DATA_DIR):
-            if file.endswith("5m.csv"):
-                symbol = file.replace("_5m.csv", "")
-                df = pd.read_csv(os.path.join(DATA_DIR, file))
-                df["ticker"] = symbol
-                df["timestamp"] = pd.to_datetime(df["timestamp"])
-                df["close"] = df["close"].astype(float)
-                df["open"] = df["open"].astype(float)
-                df["high"] = df["high"].astype(float)
-                df["low"] = df["low"].astype(float)
-                df["volume"] = df["volume"].astype(float)
+        # Trade log for realized events
+        self.trades: list[Dict[str, Any]] = []
 
-                df["ema_9"] = ta.trend.ema_indicator(df["close"], window=9)
-                df["ema_21"] = ta.trend.ema_indicator(df["close"], window=21)
-                df["ema_50"] = ta.trend.ema_indicator(df["close"], window=50)
-                df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
+        # Optional global flags used by your strategies (kept for backwards-compatibility)
+        self.recovery_phase: bool = False
 
-                bb = BollingerBands(close=df["close"], window=20, window_dev=2)
-                df["bb_high"] = bb.bollinger_hband()
-                df["bb_low"] = bb.bollinger_lband()
-                df["bb_width"] = df["bb_high"] - df["bb_low"]
+    # ------------------------------
+    # Public API
+    # ------------------------------
+    def on_candle(self, symbol: str, candle: Candle, market_context: Dict[str, Any]):
+        """Process a single candle for a symbol.
+        The engine stays O(1) per candle; heavy feature calc belongs in strategy/state.
+        """
+        st = self.state.setdefault(symbol, {})
 
-                df["avg_volume"] = df["volume"].rolling(window=14).mean()
+        # 1) Strategy decides actions
+        actions = self.strategy.on_candle(symbol, candle, market_context, st) or {}
 
-                # Compute model features
-                df["ema_gap"] = (df["ema_9"] - df["ema_21"]) / df["ema_21"]
-                df["volume_ratio"] = df["volume"] / df["avg_volume"]
-                df["above_ema_50"] = (df["close"] > df["ema_50"]).astype(int)
-                df["bb_width"] = df["bb_high"] - df["bb_low"]
+        # 2) Optional: update per-position risk controls before acting (TSL, time-based exits, etc.)
+        self._risk_manage_open_position(symbol, candle)
 
-                # Prepare model input
-                features = ["ema_gap", "rsi", "volume_ratio", "bb_width", "above_ema_50"]
-                df_model = df[features].copy()
-                df_model = df_model.replace([np.inf, -np.inf], np.nan).dropna()
+        # 3) Execute actions in deterministic order: close → open → modify
+        if actions.get("close_long"):
+            self._close_long(symbol, candle)
 
-                # Predict probabilities in batch
-                df.loc[df_model.index, "ml_proba"] = model.predict_proba(df_model)[:, 1]
+        if actions.get("open_long"):
+            size = float(actions.get("size", 1.0))
+            tp = _safe_float(actions.get("tp"))
+            sl = _safe_float(actions.get("sl"))
+            self._open_long(symbol, candle, size=size, tp=tp, sl=sl)
 
-                dfs.append(df)
-        return pd.concat(dfs).sort_values(by="timestamp").reset_index(drop=True)
+        if "tp" in actions or "sl" in actions:
+            # post-open modification (e.g., trail stop after entry)
+            self._modify_orders(symbol, tp=_safe_float(actions.get("tp")), sl=_safe_float(actions.get("sl")))
 
-    def load_btc_trend(self):
-        btc_path = os.path.join(DATA_DIR, BTC_FILE)
-        df_btc = pd.read_csv(btc_path)
-        df_btc["timestamp"] = pd.to_datetime(df_btc["timestamp"])
-        df_btc["close"] = df_btc["close"].astype(float)
-        df_btc["ema_9"] = ta.trend.ema_indicator(df_btc["close"], window=9)
-        df_btc["ema_21"] = ta.trend.ema_indicator(df_btc["close"], window=21)
-        df_btc["btc_trend_up"] = (
-            (df_btc["close"] > df_btc["ema_9"]) &
-            (df_btc["ema_9"] > df_btc["ema_21"])
-        )
-        return df_btc[["timestamp", "btc_trend_up"]]
+    def summary(self) -> Dict[str, Any]:
+        realized = sum(t.get("pnl", 0.0) for t in self.trades if t.get("type") == "SELL")
+        return {
+            "initial_capital": self.initial_capital,
+            "cash": round(self.cash, 6),
+            "open_positions": len(self.positions),
+            "trades": len(self.trades),
+            "realized_pnl": round(realized, 6),
+        }
 
-    def run_backtest(self):
-        df = self.load_data()
-        btc_trend = self.load_btc_trend()
-        df = df.merge(btc_trend, on="timestamp", how="left")
+    # ------------------------------
+    # Internals
+    # ------------------------------
+    def _open_long(self, symbol: str, candle: Candle, *, size: float, tp: Optional[float], sl: Optional[float]):
+        if symbol in self.positions:
+            return  # already long; ignore or convert to scale-in logic
+        if len(self.positions) >= self.max_positions:
+            return
+        price = float(candle["close"])
+        self.positions[symbol] = {"entry": price, "size": float(size), "tp": tp, "sl": sl}
+        self.trades.append({
+            "type": "BUY",
+            "symbol": symbol,
+            "price": price,
+            "size": float(size),
+            "ts": int(candle["ts"]),
+        })
 
-        all_timestamps = df["timestamp"].drop_duplicates().sort_values().reset_index(drop=True)
+    def _close_long(self, symbol: str, candle: Candle):
+        pos = self.positions.pop(symbol, None)
+        if not pos:
+            return
+        exit_p = float(candle["close"])
+        pnl = (exit_p - float(pos["entry"])) * float(pos["size"])
+        self.cash += pnl
+        self.trades.append({
+            "type": "SELL",
+            "symbol": symbol,
+            "price": exit_p,
+            "size": float(pos["size"]),
+            "ts": int(candle["ts"]),
+            "pnl": pnl,
+        })
 
-        for current_time in all_timestamps:
-            if self.trading_paused_until and current_time < self.trading_paused_until:
-                continue
-            if self.trading_paused_until and current_time >= self.trading_paused_until:
-                self.recovery_phase = 1
-                self.trading_paused_until = None
+    def _modify_orders(self, symbol: str, *, tp: Optional[float], sl: Optional[float]):
+        if symbol not in self.positions:
+            return
+        if tp is not None:
+            self.positions[symbol]["tp"] = float(tp)
+        if sl is not None:
+            self.positions[symbol]["sl"] = float(sl)
 
-            self.positions = [pos for pos in self.positions if pos["exit_time"] > current_time]
-            #print(f"Timestamp: {current_time}")
+    def _risk_manage_open_position(self, symbol: str, candle: Candle):
+        """Simple built-ins: take-profit / stop-loss execution. Extend as needed."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        high = float(candle["high"]) if "high" in candle else float(candle["close"])
+        low = float(candle["low"]) if "low" in candle else float(candle["close"])
+        price_for_tp = high
+        price_for_sl = low
 
-            if self.recovery_phase == 1:
-                cap_limit = 0.2 * self.current_capital
-            elif self.recovery_phase == 2:
-                cap_limit = 0.5 * self.current_capital
-            else:
-                cap_limit = self.current_capital
+        # Check TP
+        tp = pos.get("tp")
+        if tp is not None and price_for_tp >= float(tp):
+            # simulate fill at TP
+            fake_candle = dict(candle)
+            fake_candle["close"] = float(tp)
+            self._close_long(symbol, fake_candle)
+            return  # position is gone
 
-            open_positions = [pos for pos in self.positions if pos["exit_time"] > current_time]
-            #print (open_positions)
-            capital_used = sum(pos["capital"] for pos in open_positions)
-            #print ("capital used: ", capital_used)
-            capital_available = cap_limit - capital_used
-            current_candles = df[df["timestamp"] == current_time]
+        # Check SL
+        sl = pos.get("sl")
+        if sl is not None and price_for_sl <= float(sl):
+            # simulate fill at SL
+            fake_candle = dict(candle)
+            fake_candle["close"] = float(sl)
+            self._close_long(symbol, fake_candle)
 
-            for _, row in current_candles.iterrows():
-                ticker_data = df[df["ticker"] == row["ticker"]].reset_index(drop=True)
-                idx = ticker_data[ticker_data["timestamp"] == current_time].index[0]
 
-                if idx < 50 or idx + 1 >= len(ticker_data):
-                    continue
-
-                candle = ticker_data.iloc[idx]
-                previous_candle = ticker_data.iloc[idx - 1]
-                market_context = {
-                    "btc_trend_up": row.get("btc_trend_up", True),
-                    "recovery_phase": self.recovery_phase
-                }
-
-                if self.strategy.should_enter_trade(candle, previous_candle, market_context):
-                    if capital_available >= INVESTMENT_PER_TRADE:
-                        trade = {"entry_price": candle["close"], "size": INVESTMENT_PER_TRADE, "start_idx": idx}
-                        success, profit = self.strategy.manage_open_trade(trade, ticker_data)
-                        capital_available -= INVESTMENT_PER_TRADE
-                        self.positions.append({
-                            "ticker": row["ticker"],
-                            "entry_time": current_time,
-                            "exit_time": current_time + pd.Timedelta(minutes=5 * MAX_HOLDING_CANDLES),
-                            "capital": INVESTMENT_PER_TRADE
-                        })
-
-                        # Record signal
-                        self.trade_signals.append({
-                            "ticker": row["ticker"],
-                            "timestamp": current_time,
-                            "price": candle["close"],
-                            "successful": success
-                        })
-
-                        print(f"Open position {row['ticker']} at {current_time} and profit was {profit:.2f} and total profit {self.total_profit:.2f} and capital available: {capital_available:.2f}")
-
-                        self.total_profit += profit
-                        self.current_capital = MAX_CAPITAL + self.total_profit
-                        self.total_trades += 1
-                        if success:
-                            self.successful_trades += 1
-                            if self.recovery_phase == 1:
-                                self.recovery_phase = 2
-                            elif self.recovery_phase == 2:
-                                self.recovery_phase = 3
-                        else:
-                            self.recent_losses.append(current_time)
-                            self.recent_losses = [t for t in self.recent_losses if (current_time - t).total_seconds() <= 1800]
-                            if len(self.recent_losses) >= 3:
-                                self.trading_paused_until = current_time + pd.Timedelta(hours=1)
-                                print(f"Trading paused until {self.trading_paused_until} due to loss streak")
-
-        self.report()
-        self.plot_price_trends(df)
-
-    def report(self):
-        print(f"Total Trades: {self.total_trades}")
-        print(f"Successful Trades: {self.successful_trades}")
-        if self.total_trades > 0:
-            print(f"Success Rate: {self.successful_trades / self.total_trades:.2%}")
-            print(f"Total Profit: ${self.total_profit:.2f}")
-            print(f"ROI: {(self.total_profit / MAX_CAPITAL) * 100:.2f}%")
-
-    def plot_price_trends(self, df):
-        tickers = df["ticker"].unique()
-        signals_df = pd.DataFrame(self.trade_signals)
-        fig, axs = plt.subplots(len(tickers), 1, figsize=(12, len(tickers) * 2), sharex=True)
-        if len(tickers) == 1:
-            axs = [axs]
-
-        for ax, ticker in zip(axs, tickers):
-            sub_df = df[df["ticker"] == ticker]
-            ax.plot(sub_df["timestamp"], sub_df["close"], label=f"{ticker} Price")
-
-            # Plot trade signals
-            if not signals_df.empty:
-                buy_signals = signals_df[(signals_df["ticker"] == ticker)]
-                ax.scatter(buy_signals["timestamp"], buy_signals["price"],
-                           c=buy_signals["successful"].map({True: "green", False: "red"}),
-                           label="Trade Signals", marker="o", s=40, alpha=0.8)
-
-            ax.set_title(f"{ticker} Price Trend")
-            ax.set_ylabel("Price")
-            ax.legend()
-
-        plt.tight_layout()
-        plt.show()
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        return None if x is None else float(x)
+    except (TypeError, ValueError):
+        return None

@@ -1,79 +1,110 @@
-# train_momentum_model.py
-
+# scripts/train_model.py
+import os, json, argparse
 import pandas as pd
-from sklearn.model_selection import train_test_split
+import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, average_precision_score
+from sklearn.model_selection import train_test_split
 import joblib
 
-# Load labeled dataset
-df = pd.read_csv("../ml_dataset.csv", low_memory=False)
+# ---------- CONFIG (edit here or pass via CLI) ----------
+DEFAULT_DATASET = "./ml_dataset.csv"
+DEFAULT_MODEL   = "./models/momentum_model.pkl"
+DEFAULT_META    = "./models/momentum_model.meta.json"
+DEFAULT_THRESH  = 0.45  # used by runtime strategy
+TIME_SPLIT_COL  = "ts"  # or a datetime col in your dataset; else we’ll fall back to random split
+TIME_SPLIT_PCT  = 0.8   # first 80% of time → train; last 20% → test
+FEATURES = ["ema_gap", "rsi", "volume_ratio", "bb_width", "above_ema_50"]
+TARGET   = "label"
+# --------------------------------------------------------
 
-# Drop any remaining NaNs
-df.dropna(inplace=True)
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", default=DEFAULT_DATASET)
+    ap.add_argument("--model_out", default=DEFAULT_MODEL)
+    ap.add_argument("--meta_out", default=DEFAULT_META)
+    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESH)
+    ap.add_argument("--time_split", action="store_true", help="Use time-based split by TIME_SPLIT_COL.")
+    return ap.parse_args()
 
-# Feature columns used for training
-features = [
-    "ema_gap",
-    "rsi",
-    "volume_ratio",
-    "bb_width",
-    "above_ema_50"
-]
+def time_based_split(df, frac=0.8, time_col=TIME_SPLIT_COL):
+    if time_col not in df.columns:
+        return None, None, None, None
+    df = df.sort_values(time_col)
+    n = len(df)
+    cut = int(n * frac)
+    train, test = df.iloc[:cut], df.iloc[cut:]
+    Xtr, ytr = train[FEATURES], train[TARGET]
+    Xte, yte = test[FEATURES], test[TARGET]
+    return Xtr, Xte, ytr, yte
 
-# Ensure 'above_ema_50' is numeric
-df["above_ema_50"] = pd.to_numeric(df["above_ema_50"], errors='coerce').fillna(0).astype(int)
+def main():
+    args = parse_args()
+    os.makedirs(os.path.dirname(args.model_out), exist_ok=True)
 
-# Input and target
-X = df[features]
-y = df["label"]
+    df = pd.read_csv(args.dataset, low_memory=False)
+    # ensure numeric
+    for col in FEATURES + [TARGET]:
+        if col in df.columns and df[col].dtype == "object":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # 'above_ema_50' to {0,1}
+    if "above_ema_50" in df.columns:
+        df["above_ema_50"] = pd.to_numeric(df["above_ema_50"], errors="coerce").fillna(0).astype(int)
 
-# Drop labels that appear less than twice (for safety)
-label_counts = y.value_counts()
-valid_labels = label_counts[label_counts >= 2].index
-mask = y.isin(valid_labels)
-X = X[mask]
-y = y[mask]
+    # drop incomplete rows
+    df = df.dropna(subset=FEATURES + [TARGET]).copy()
 
-# Combine into a single DataFrame for balancing
-df_balanced = X.copy()
-df_balanced["label"] = y
+    # --- Split
+    if args.time_split:
+        split = time_based_split(df)
+        if split[0] is None:
+            print(f"[WARN] time column '{TIME_SPLIT_COL}' not found; falling back to random split.")
+            X = df[FEATURES]; y = df[TARGET]
+            Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+        else:
+            Xtr, Xte, ytr, yte = split
+    else:
+        X = df[FEATURES]; y = df[TARGET]
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 
-# Split into winners and losers
-winners = df_balanced[df_balanced["label"] == 1]
-losers = df_balanced[df_balanced["label"] == 0].sample(n=len(winners), random_state=42)
+    # --- Model (RF + calibration)
+    base_rf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_leaf=2,
+        n_jobs=-1,
+        class_weight="balanced",
+        random_state=42,
+    )
+    clf = CalibratedClassifierCV(base_rf, method="sigmoid", cv=3)
+    clf.fit(Xtr, ytr)
 
-# Combine balanced set
-df_final = pd.concat([winners, losers]).sample(frac=1, random_state=42)
-X = df_final[features]
-y = df_final["label"]
+    # --- Evaluation
+    yhat = clf.predict(Xte)
+    yproba = clf.predict_proba(Xte)[:, 1]
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(yte, yhat))
+    print("\nClassification Report:")
+    print(classification_report(yte, yhat, digits=4))
+    try:
+        print(f"AUC: {roc_auc_score(yte, yproba):.4f}")
+        print(f"PR-AUC: {average_precision_score(yte, yproba):.4f}")
+    except Exception:
+        pass
 
-# Print label distribution after balancing
-print("\n✅ Rebalanced label distribution:")
-print(y.value_counts(normalize=True))
+    # --- Save model + metadata
+    joblib.dump(clf, args.model_out)
+    meta = {
+        "features": FEATURES,
+        "threshold": args.threshold,
+        "dataset": os.path.abspath(args.dataset),
+        "time_split": args.time_split,
+    }
+    with open(args.meta_out, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"\nModel saved to {args.model_out}")
+    print(f"Meta saved to  {args.meta_out}")
 
-# Train-test split
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=42
-)
-
-# Initialize and train model with class balancing
-clf = RandomForestClassifier(
-    n_estimators=100,
-    max_depth=10,
-    class_weight="balanced",
-    random_state=42
-)
-clf.fit(X_train, y_train)
-
-# Evaluate
-y_pred = clf.predict(X_test)
-print("\nConfusion Matrix:")
-print(confusion_matrix(y_test, y_pred))
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred, digits=4))
-
-# Save the model
-model_path = "../momentum_model.pkl"
-joblib.dump(clf, model_path)
-print(f"\nModel saved to {model_path}")
+if __name__ == "__main__":
+    main()
