@@ -6,12 +6,15 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, average_precision_score
 from sklearn.model_selection import train_test_split
+from pathlib import Path
 import joblib
 
 # ---------- CONFIG (edit here or pass via CLI) ----------
-DEFAULT_DATASET = "./ml_dataset.csv"
-DEFAULT_MODEL   = "./models/momentum_model.pkl"
-DEFAULT_META    = "./models/momentum_model.meta.json"
+SCRIPT_DIR = Path(__file__).resolve().parent        # .../src
+REPO_ROOT  = SCRIPT_DIR.parent                      # repo root
+DEFAULT_DATASET = str((REPO_ROOT / "ml_dataset.csv").resolve())
+DEFAULT_MODEL   = str((REPO_ROOT / "models" / "momentum_model.pkl").resolve())
+DEFAULT_META    = str((REPO_ROOT / "models" / "momentum_model.meta.json").resolve())
 DEFAULT_THRESH  = 0.45  # used by runtime strategy
 TIME_SPLIT_COL  = "ts"  # or a datetime col in your dataset; else we’ll fall back to random split
 TIME_SPLIT_PCT  = 0.8   # first 80% of time → train; last 20% → test

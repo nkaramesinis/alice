@@ -13,7 +13,10 @@ from urllib3.exceptions import ProtocolError
 START_DATE   = "2025-07-01 00:00:00"     # start datetime (local)
 DAYS_LIMIT   = 30                         # how many days to fetch
 INTERVAL     = "5m"                       # Binance kline interval
-OUTPUT_DIR   = "../data/backtest_data_20250701-30days"
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # /.../Trader (git)/scripts
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..", "data","backtest_data_20250701-30days")       # /.../Trader (git)/data
+
 TARGET_TICKERS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # [] = fetch all USDT spot tickers
 SLEEP_BETWEEN_REQUESTS = 0.2              # be gentle with the API
 # ========================
@@ -35,28 +38,53 @@ def get_spot_tickers(quote="USDT"):
 
 
 def fetch_klines_since(ticker, interval, start_date, days, retries=5, delay=3):
-    """
-    Pull klines page-by-page from Binance starting at start_date for `days` days.
-    Returns a list of raw kline rows.
-    """
     start = int(pd.to_datetime(start_date).timestamp() * 1000)
     end   = int((pd.to_datetime(start_date) + timedelta(days=days)).timestamp() * 1000)
+
+    # Map interval to milliseconds (covers your common cases; extend if needed)
+    interval_map_ms = {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+        "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
+        "1d": 86_400_000
+    }
+    interval_ms = interval_map_ms.get(interval)
+    if interval_ms is None:
+        raise ValueError(f"Unsupported interval: {interval}")
+
     out = []
     while start < end:
         url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": ticker, "interval": interval, "startTime": start, "limit": 1000}
+
+        # Always cap by end-1 so we never spill past your window
+        params = {
+            "symbol": ticker,
+            "interval": interval,
+            "startTime": start,
+            "endTime": end - 1,
+            "limit": 1000
+        }
+
         for attempt in range(retries):
             try:
                 res = requests.get(url, params=params, timeout=15)
-                if res.status_code == 429:  # rate limited
+                if res.status_code == 429:
                     time.sleep(60); continue
                 res.raise_for_status()
                 batch = res.json()
                 if not batch:
+                    # Nothing more in range
                     return out
+
                 out.extend(batch)
-                # step to next window: last candle close_time + 1 ms
-                start = batch[-1][6] + 1
+
+                # Advance to just after the last candle's close_time
+                last_close = batch[-1][6]
+                start = last_close + 1
+
+                # If we’ve reached or passed end, stop
+                if start >= end:
+                    return out
+
                 time.sleep(SLEEP_BETWEEN_REQUESTS)
                 break
             except (RequestException, ConnectionError, ProtocolError):
@@ -87,6 +115,9 @@ def save_csv(ticker, interval, candles, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     fp = os.path.join(out_dir, f"{ticker}_{interval}.csv")
     df.to_csv(fp, index=False)
+
+    print(f"Saved {len(df)} candles for {ticker} → {os.path.abspath(fp)}")
+
     return fp, len(df)
 
 
